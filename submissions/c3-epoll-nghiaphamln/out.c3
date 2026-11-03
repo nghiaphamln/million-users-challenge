@@ -37,14 +37,40 @@ fn void putu(ulong v)
 
 const String HEXD = "0123456789abcdef";
 
-// JSON string contents, escaped
+// True if any byte of w needs escaping in a JSON string: < 0x20, '"' or '\\' (SWAR: a byte that
+// equals x makes a zero in w ^ x * 0x0101..., and a zero byte sets its high bit in (v - 0x01..) & ~v & 0x80..).
+fn bool needs_escape(ulong w) @inline
+{
+	ulong q = w ^ 0x2222222222222222;
+	ulong bs = w ^ 0x5c5c5c5c5c5c5c5c;
+	ulong zero = ((q - 0x0101010101010101) & ~q) | ((bs - 0x0101010101010101) & ~bs);
+	ulong ctl = w - 0x2020202020202020;  // a byte < 0x20 borrows: its high bit is set unless the byte was >= 0x80
+	return ((zero | (ctl & ~w)) & 0x8080808080808080) != 0;
+}
+
+// JSON string contents, escaped. Eight bytes are checked at a time; a clean word is copied as is.
 fn void putjs(char* s, usz n)
 {
 	usz run = 0;
-	for (usz i = 0; i < n; i++)
+	usz i = 0;
+	while (i < n)
 	{
+		if (n - i >= 8)
+		{
+			ulong w;
+			memcpy(&w, s + i, 8);
+			if (!needs_escape(w))
+			{
+				i += 8;
+				continue;
+			}
+		}
 		char c = s[i];
-		if (c >= 0x20 && c != '"' && c != '\\') continue;
+		if (c >= 0x20 && c != '"' && c != '\\')
+		{
+			i++;
+			continue;
+		}
 		put(s + run, i - run);
 		run = i + 1;
 		char[6] e = { '\\', 0, 0, 0, 0, 0 };
@@ -73,6 +99,7 @@ fn void putjs(char* s, usz n)
 				e[5] = HEXD[c & 15];
 				put(&e, 6);
 		}
+		i++;
 	}
 	put(s + run, n - run);
 }
