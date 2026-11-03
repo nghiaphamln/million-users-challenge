@@ -77,6 +77,10 @@ numbers are rough.
 | 0.5 | 969 | 5.0 ms | 6.4 ms | 0 | ~39 us | 3 MB |
 | 0.1 | 4,653 | 4.5 ms | 5.3 ms | 0 | ~19 us | 3 MB |
 
+- mload, 150,000 users over 4 loopback addresses x 2 ports (the VM temporarily at 8 GB for the load generator),
+  `-gzip -think-scale 2.5`, 90 s ramp + 60 s hold: all 150,000 connections held, 0 errors, p95 6.9 ms; server
+  RSS 10 MB (150,079 descriptors), ~12% of one CPU at ~6.5k req/s. The p99 spike (183 ms) came while the load
+  generator's own 3.7 GB pushed the VM into memory pressure during the ramp.
 - Syscalls per request (strace -c): 5.0 — read, write, epoll_wait, the batching nanosleep, and the Postgres
   read/write amortized over a batch. callgrind puts the server's own code at ~85k instructions per request
   outside gzip, with gzip at ~180k per feed response.
