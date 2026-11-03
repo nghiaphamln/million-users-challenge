@@ -38,7 +38,8 @@
   slicing-by-8 included. Bodies under 1 KB are sent plain (they would not shrink).
 - **Batching window**: after a loop iteration that handled fewer than 32 events, the thread sleeps 2 ms before
   the next `epoll_wait`, so one wake-up serves everything that arrived meanwhile and the reads among it share
-  one Sync. A busy thread (32 events or more) never sleeps, so throughput is not capped.
+  one Sync. A busy thread (32 events or more) never sleeps, so throughput is not capped. (5 and 10 ms were
+  measured: no CPU saved at ~4.6k req/s on 4 threads, p95 doubled and quadrupled.)
 - **Validation**: strict RFC 8259 JSON, HS256 JWT with signature and a required `exp` checked on every request
   (the HMAC key schedule is computed once and copied per request), body trimming as JavaScript's
   `String.trim`, ids as positive decimal integers.
@@ -73,8 +74,8 @@ numbers are rough.
 
 | think-scale | req/s | p95 | p99 | errors | server CPU per request | peak RSS |
 |---|---|---|---|---|---|---|
-| 0.5 | 969 | 5.3 ms | 6.7 ms | 0 | ~100 us | 3 MB |
-| 0.1 | 4,654 | 4.6 ms | 5.8 ms | 0 | ~33 us | 3 MB |
+| 0.5 | 969 | 5.0 ms | 6.4 ms | 0 | ~39 us | 3 MB |
+| 0.1 | 4,653 | 4.5 ms | 5.3 ms | 0 | ~19 us | 3 MB |
 
 - Syscalls per request (strace -c): 5.0 — read, write, epoll_wait, the batching nanosleep, and the Postgres
   read/write amortized over a batch. callgrind puts the server's own code at ~85k instructions per request
