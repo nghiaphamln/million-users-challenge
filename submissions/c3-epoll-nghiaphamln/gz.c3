@@ -1,7 +1,9 @@
 // gzip, tuned for one JSON body per call: greedy LZ77 with a single-probe hash table (one lookup per
 // position, no chains; matches compared eight bytes at a time), the fixed Huffman block (no tree to
-// build, and the feed stays at two TCP segments either way), and a slicing-by-8 CRC. One pass.
+// build, and the feed stays at two TCP segments either way), and ISA-L's CPU-dispatched gzip CRC.
 module server;
+
+extern fn uint crc32_gzip_refl(uint initial, char* p, ulong n);
 
 tlocal char* zbuf;
 tlocal ushort* gz_head;  // hash -> last position + 1 (0: none); input is capped at 64 KB so positions fit
@@ -9,7 +11,6 @@ tlocal ushort* gz_head;  // hash -> last position + 1 (0: none); input is capped
 const usz GZ_MAX_IN = 65535;
 const uint GZ_HBITS = 13;
 
-uint[8 * 256] crc_tab;   // slicing-by-8: table t at crc_tab[t * 256 ..], built by gz_init()
 ushort[288] lit_code;    // fixed Huffman literal/length codes, bit-reversed for the LSB-first stream
 char[288] lit_bits;
 ushort[30] dist_code;    // fixed Huffman distance codes: 5 bits, bit-reversed
@@ -88,38 +89,6 @@ fn void gz_init()
 			}
 		}
 	}
-	for (uint i = 0; i < 256; i++)
-	{
-		uint c = i;
-		for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xedb88320 ^ (c >> 1) : c >> 1;
-		crc_tab[i] = c;
-	}
-	for (uint t = 1; t < 8; t++)  // needs the whole of table 0
-	{
-		for (uint i = 0; i < 256; i++)
-		{
-			uint prev = crc_tab[(t - 1) * 256 + i];
-			crc_tab[t * 256 + i] = crc_tab[prev & 0xff] ^ (prev >> 8);
-		}
-	}
-}
-
-fn uint crc32(char* p, usz n)
-{
-	uint* t = &crc_tab;
-	uint c = 0xffffffff;
-	for (; n >= 8; p += 8, n -= 8)
-	{
-		ulong w;
-		memcpy(&w, p, 8);
-		uint a = (uint)w ^ c;
-		uint b = (uint)(w >> 32);
-		c = t[7 * 256 + (a & 0xff)] ^ t[6 * 256 + ((a >> 8) & 0xff)] ^ t[5 * 256 + ((a >> 16) & 0xff)]
-		  ^ t[4 * 256 + (a >> 24)] ^ t[3 * 256 + (b & 0xff)] ^ t[2 * 256 + ((b >> 8) & 0xff)]
-		  ^ t[1 * 256 + ((b >> 16) & 0xff)] ^ t[b >> 24];
-	}
-	for (; n != 0; p++, n--) c = t[(c ^ *p) & 0xff] ^ (c >> 8);
-	return ~c;
 }
 
 struct Bits
@@ -240,7 +209,7 @@ fn usz gzip(char* in, usz n, char* out, usz cap)
 	}
 	b.sym(256);
 	b.flush();
-	uint crc = crc32(in, n);
+	uint crc = crc32_gzip_refl(0, in, n);
 	uint isz = (uint)n;
 	memcpy(out + b.n, &crc, 4);  // little-endian on every target we build for
 	memcpy(out + b.n + 4, &isz, 4);

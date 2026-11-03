@@ -2,7 +2,8 @@
 
 - Language: [C3](https://c3-lang.org) 0.8.5_1 (official static Linux tarball, SHA-256 pinned in `install.sh`),
   `-O3 --safe=no`, single module, `--x86cpu=sse4` on the box
-- Dependencies: none. libc only. The Postgres driver (`pg.c3`), the HTTP parser (`http.c3`), the JSON
+- Dependencies: libc and ISA-L 2.31.1 (BSD-3-Clause), source SHA-256 pinned in `build.sh`, linked statically
+  for its CPU-dispatched gzip CRC only. The Postgres driver (`pg.c3`), the HTTP parser (`http.c3`), the JSON
   parser (`json.c3`) and the gzip encoder (`gz.c3`) are part of the program; HMAC-SHA256, SHA-256, PBKDF2 and MD5
   come from the C3 standard library.
 - Front: direct (no Nginx), ports `PORT` and `EXTRA_PORT`
@@ -34,8 +35,8 @@
 - **gzip** (`gz.c3`): greedy LZ77 with a single-probe hash table (four bytes hashed, one lookup per position,
   no chains; matches are compared eight bytes at a time) and the fixed Huffman block, in one pass. The feed
   (5.1 KB) comes out at ~2.4 KB; a per-body dynamic tree would save ~15% of the bytes but no TCP segment (two
-  either way) and costs twice the instructions, so it was dropped. ~90k instructions per feed (callgrind), CRC
-  slicing-by-8 included. Bodies under 1 KB are sent plain (they would not shrink).
+  either way) and costs twice the instructions, so it was dropped. The earlier scalar-CRC version measured
+  ~90k instructions per feed (callgrind); CRC now uses ISA-L. Bodies under 1 KB are sent plain.
 - **Batching window**: after a loop iteration that handled fewer than 32 events, the thread sleeps 2 ms before
   the next `epoll_wait`, so one wake-up serves everything that arrived meanwhile and the reads among it share
   one Sync. A busy thread (32 events or more) never sleeps, so throughput is not capped. (5 and 10 ms were
@@ -61,9 +62,11 @@
 - The box (rule 13): nothing outside the process is touched. The affinity mask is read, not set; `setrlimit`
   raises the process's own soft `RLIMIT_NOFILE` to the hard limit; socket options are `SO_REUSEPORT`,
   `SO_REUSEADDR` and `TCP_NODELAY`. No sysctl, no CPU pinning, no priorities.
-- `install.sh` installs the toolchain only (c3c tarball, build-essential for the link step).
+- `install.sh` installs the toolchain (c3c tarball, build-essential and nasm). `build.sh` downloads and
+  verifies the ISA-L source before compiling the static archive; the server still implements its own LZ77
+  and fixed-Huffman encoder.
 
-## Measured locally
+## Earlier local measurements (before the CRC change)
 
 Docker on an Apple-silicon Mac (Colima VM, 4 CPUs, 3 GB), Postgres 18 in a container with the box config
 scaled down (`shared_buffers=384MB`); server, Postgres and the load generator share the same 4 CPUs, so the
@@ -91,9 +94,34 @@ numbers are rough.
 ## Running
 
 ```bash
-sudo ./install.sh   # c3c 0.8.5_1 into /opt/c3, build-essential
+sudo ./install.sh   # c3c 0.8.5_1 into /opt/c3, build-essential, nasm
 ./build.sh          # c3c compile *.c3 -> bin/server
 DATABASE_URL=postgres://user:pass@host:5432/feed JWT_SECRET=million-users-challenge \
   HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 ./start.sh
 ```
 
+
+## Validation and local comparison
+
+The gzip regression test compiles the real encoder and checks random, repetitive and Unicode inputs against
+Python's independent gzip decoder, including CRC and uncompressed-length checks:
+
+```bash
+./build.sh
+python3 test/check_gzip.py  # Python 3.9+
+```
+
+For API validation from the repository root, use
+`bash test/run.sh submissions/c3-epoll-nghiaphamln` against a separate seeded test database.
+The [Rust load client](bench/README.md) is intended for local comparisons with many keep-alive connections.
+It does not establish an official leaderboard score.
+
+Local 2026-11-04 comparison: the CRC change reduced steady application CPU/request by about 4.8% at
+200,000 connections. A 300,000-connection run completed 4.72M requests without errors. See the
+[method, top-six comparison and raw audit data](bench/README.md#2026-11-04-comparison).
+These are ARM Docker results, not official leaderboard scores.
+
+The updated submission passed 42/42 API checks on native ARM Linux and on a clean Ubuntu 24.04 x86-64
+container under emulation, including independent gzip checks on both ports. The gzip regression suite
+passed 19 inputs on both architectures; the Rust client passed five unit tests. The installer now prints
+the complete compiler version, avoiding a `head`/`pipefail` SIGPIPE during installation.

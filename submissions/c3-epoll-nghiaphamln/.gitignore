@@ -1,2 +1,5 @@
 bin/
+deps/
+bench/client/target/
 core
+test/__pycache__/
