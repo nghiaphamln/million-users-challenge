@@ -7,7 +7,7 @@
   come from the C3 standard library.
 - Front: direct (no Nginx), ports `PORT` and `EXTRA_PORT`
 - Postgres connections: 64 in all (`max(2, 64 / threads)` per thread)
-- Compression: gzip for bodies of 1 KB or more (in practice only `/feed`): 5.1 KB -> 2.1 KB
+- Compression: gzip for bodies of 1 KB or more (in practice only `/feed`): 5.1 KB -> 2.4 KB
 
 ## Design
 
@@ -31,12 +31,11 @@
   for Postgres its connection is "busy"; pipelined requests behind it wait in a per-connection buffer, so
   responses stay in order. A response is built in a per-thread arena and sent with one `write`, gzip included.
   Keep-alive connections are never timed out.
-- **gzip** (`gz.c3`): greedy LZ77 with a single-probe hash table (one lookup per position, no chains;
-  matches are compared eight bytes at a time) into a token buffer, then one dynamic-Huffman
-  block with trees built for that body (RFC 1951 3.2.7: zlib's length-limiting, canonical codes, run-length
-  coded header). Nothing is trained or tuned on the data: every response gets its own optimal trees. On the
-  sample feed: 5,102 -> 2,062 bytes, ~180k instructions (callgrind). CRC is slicing-by-8. Bodies under 1 KB
-  are sent plain (they would not shrink).
+- **gzip** (`gz.c3`): greedy LZ77 with a single-probe hash table (four bytes hashed, one lookup per position,
+  no chains; matches are compared eight bytes at a time) and the fixed Huffman block, in one pass. The feed
+  (5.1 KB) comes out at ~2.4 KB; a per-body dynamic tree would save ~15% of the bytes but no TCP segment (two
+  either way) and costs twice the instructions, so it was dropped. ~90k instructions per feed (callgrind), CRC
+  slicing-by-8 included. Bodies under 1 KB are sent plain (they would not shrink).
 - **Batching window**: after a loop iteration that handled fewer than 32 events, the thread sleeps 2 ms before
   the next `epoll_wait`, so one wake-up serves everything that arrived meanwhile and the reads among it share
   one Sync. A busy thread (32 events or more) never sleeps, so throughput is not capped.

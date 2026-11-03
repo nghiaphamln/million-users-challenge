@@ -1,20 +1,18 @@
 // gzip, tuned for one JSON body per call: greedy LZ77 with a single-probe hash table (one lookup per
-// position, no chains, like igzip level 0; matches compared eight bytes at a time), then one dynamic
-// Huffman block with trees built for this body (RFC 1951 3.2.7), and a slicing-by-8 CRC.
-// Two passes: LZ77 into a token buffer while counting symbols, then the trees and the bits.
+// position, no chains; matches compared eight bytes at a time), the fixed Huffman block (no tree to
+// build, and the feed stays at two TCP segments either way), and a slicing-by-8 CRC. One pass.
 module server;
 
 tlocal char* zbuf;
 tlocal ushort* gz_head;  // hash -> last position + 1 (0: none); input is capped at 64 KB so positions fit
-tlocal uint* gz_tok;     // LZ77 tokens: a literal byte, or MATCH | len << 16 | dist
 
 const usz GZ_MAX_IN = 65535;
 const uint GZ_HBITS = 13;
-const uint MATCH = 1u << 31;
-const uint NLIT = 286;   // literal/length symbols in use (0..285)
-const uint NDIST = 30;
 
 uint[8 * 256] crc_tab;   // slicing-by-8: table t at crc_tab[t * 256 ..], built by gz_init()
+ushort[288] lit_code;    // fixed Huffman literal/length codes, bit-reversed for the LSB-first stream
+char[288] lit_bits;
+ushort[30] dist_code;    // fixed Huffman distance codes: 5 bits, bit-reversed
 char[259] len_sym;       // match length -> length symbol index 0..28
 char[257] dist_sym_lo;   // distance -> distance symbol: d <= 256 by d ...
 char[257] dist_sym_hi;   // ... else by (d - 1) >> 7
@@ -25,10 +23,51 @@ uint[30] dist_base = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193
 	1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
 char[30] dist_extra = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
 	12, 13, 13 };
-char[19] cl_order = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+
+// Huffman codes go out MSB-first inside the LSB-first stream.
+fn uint rev(uint v, uint n)
+{
+	uint r = 0;
+	for (uint i = 0; i < n; i++)
+	{
+		r = r << 1 | (v & 1);
+		v >>= 1;
+	}
+	return r;
+}
 
 fn void gz_init()
 {
+	// RFC 1951 3.2.6: 0-143: 8 bits from 0x30; 144-255: 9 bits from 0x190; 256-279: 7 bits from 0;
+	// 280-287: 8 bits from 0xc0; distances: 5 bits
+	for (uint s = 0; s < 288; s++)
+	{
+		uint code;
+		uint bits;
+		if (s < 144)
+		{
+			code = 0x30 + s;
+			bits = 8;
+		}
+		else if (s < 256)
+		{
+			code = 0x190 + s - 144;
+			bits = 9;
+		}
+		else if (s < 280)
+		{
+			code = s - 256;
+			bits = 7;
+		}
+		else
+		{
+			code = 0xc0 + s - 280;
+			bits = 8;
+		}
+		lit_code[s] = (ushort)rev(code, bits);
+		lit_bits[s] = (char)bits;
+	}
+	for (uint d = 0; d < 30; d++) dist_code[d] = (ushort)rev(d, 5);
 	for (uint c = 0; c < 29; c++)
 	{
 		for (uint l = len_base[c]; l < 259 && (c == 28 || l < len_base[c + 1]); l++) len_sym[l] = (char)c;
@@ -83,123 +122,6 @@ fn uint crc32(char* p, usz n)
 	return ~c;
 }
 
-// ---------- Huffman code lengths, limited to maxbits, always a complete code (zlib's method) ----------
-// freq[s] = 0 leaves symbol s without a code. lens[s] receives the length. Returns the largest length.
-fn uint huff_lengths(uint* freq, uint n, uint maxbits, char* lens)
-{
-	// nodes: leaves first (symbols with freq > 0), then internal nodes; a two-queue merge over sorted leaves
-	uint[2 * 286] nf;
-	ushort[2 * 286] parent;
-	ushort[286] order;
-	uint nleaf = 0;
-	for (uint s = 0; s < n; s++)
-	{
-		lens[s] = 0;
-		if (freq[s] != 0) order[nleaf++] = (ushort)s;
-	}
-	if (nleaf == 0) return 0;
-	if (nleaf == 1)  // deflate needs at least one 1-bit code; fine for a decoder
-	{
-		lens[order[0]] = 1;
-		return 1;
-	}
-	for (uint i = 1; i < nleaf; i++)  // insertion sort by frequency: n is small
-	{
-		ushort s = order[i];
-		uint j = i;
-		while (j > 0 && freq[order[j - 1]] > freq[s])
-		{
-			order[j] = order[j - 1];
-			j--;
-		}
-		order[j] = s;
-	}
-	for (uint i = 0; i < nleaf; i++) nf[i] = freq[order[i]];
-	uint li = 0;        // next leaf
-	uint ii = nleaf;    // next internal node
-	uint next = nleaf;  // where the next internal node goes
-	while ((nleaf - li) + (next - ii) > 1)
-	{
-		uint a;
-		uint b;
-		if (ii < next && (li >= nleaf || nf[ii] <= nf[li])) { a = ii++; } else { a = li++; }
-		if (ii < next && (li >= nleaf || nf[ii] <= nf[li])) { b = ii++; } else { b = li++; }
-		nf[next] = nf[a] + nf[b];
-		parent[a] = (ushort)next;
-		parent[b] = (ushort)next;
-		next++;
-	}
-	uint[32] bl_count = {};
-	uint maxlen = 0;
-	char[2 * 286] depth;
-	depth[next - 1] = 0;
-	for (uint i = next - 1; i-- > 0;)  // children come before their parent
-	{
-		uint d = (uint)depth[parent[i]] + 1;
-		depth[i] = (char)d;
-		if (i < nleaf)
-		{
-			if (d > maxlen) maxlen = d;
-			bl_count[d < 31 ? d : 31]++;
-		}
-	}
-	if (maxlen > maxbits)
-	{
-		// too deep: zlib's overflow fix on the length histogram, then reassign lengths in frequency order
-		uint overflow = 0;
-		for (uint d = maxbits + 1; d <= maxlen && d < 32; d++)
-		{
-			overflow += bl_count[d];
-			bl_count[d] = 0;
-		}
-		bl_count[maxbits] += overflow;
-		do
-		{
-			uint bits = maxbits - 1;
-			while (bl_count[bits] == 0) bits--;
-			bl_count[bits]--;
-			bl_count[bits + 1] += 2;
-			bl_count[maxbits]--;
-			overflow -= 2;
-		} while ((int)overflow > 0);
-		maxlen = maxbits;
-		uint k = 0;  // least frequent leaves get the longest codes
-		for (uint d = maxbits; d >= 1; d--)
-		{
-			for (uint c = bl_count[d]; c != 0; c--) depth[k++] = (char)d;
-		}
-	}
-	for (uint i = 0; i < nleaf; i++) lens[order[i]] = depth[i];
-	return maxlen;
-}
-
-// RFC 1951 3.2.2: codes from lengths, bit-reversed for the LSB-first stream.
-fn void canonical(char* lens, uint n, ushort* codes)
-{
-	uint[16] count = {};
-	uint[16] next;
-	for (uint s = 0; s < n; s++) count[lens[s]]++;
-	count[0] = 0;
-	uint c = 0;
-	for (uint b = 1; b < 16; b++)
-	{
-		c = (c + count[b - 1]) << 1;
-		next[b] = c;
-	}
-	for (uint s = 0; s < n; s++)
-	{
-		if (lens[s] == 0) continue;
-		uint v = next[lens[s]]++;
-		uint r = 0;
-		for (uint i = 0; i < lens[s]; i++)
-		{
-			r = r << 1 | (v & 1);
-			v >>= 1;
-		}
-		codes[s] = (ushort)r;
-	}
-}
-
 struct Bits
 {
 	char* out;
@@ -233,108 +155,33 @@ fn void Bits.flush(&self)
 	}
 }
 
-// The dynamic block header: HLIT, HDIST, HCLEN, the code-length code, then both length lists run-length
-// coded.
-fn void put_header(Bits* b, char* ll, char* dl)
+fn void Bits.sym(&self, uint s) @inline
 {
-	char[NLIT + NDIST] all;
-	memcpy(&all, ll, NLIT);
-	memcpy(&all[NLIT], dl, NDIST);
-	char[NLIT + NDIST] rsym;  // run-length symbols 0..18 ...
-	char[NLIT + NDIST] rext;  // ... and their extra bits
-	uint nr = 0;
-	uint[19] cf = {};
-	for (uint i = 0; i < NLIT + NDIST;)
-	{
-		char v = all[i];
-		uint j = i + 1;
-		while (j < NLIT + NDIST && all[j] == v) j++;
-		uint run = j - i;
-		if (v == 0)
-		{
-			while (run >= 11)
-			{
-				uint r = run < 138 ? run : 138;
-				rsym[nr] = 18;
-				rext[nr++] = (char)(r - 11);
-				run -= r;
-			}
-			while (run >= 3)
-			{
-				uint r = run < 10 ? run : 10;
-				rsym[nr] = 17;
-				rext[nr++] = (char)(r - 3);
-				run -= r;
-			}
-			while (run > 0)
-			{
-				rsym[nr] = 0;
-				rext[nr++] = 0;
-				run--;
-			}
-		}
-		else
-		{
-			rsym[nr] = v;
-			rext[nr++] = 0;
-			run--;
-			while (run >= 3)
-			{
-				uint r = run < 6 ? run : 6;
-				rsym[nr] = 16;
-				rext[nr++] = (char)(r - 3);
-				run -= r;
-			}
-			while (run > 0)
-			{
-				rsym[nr] = v;
-				rext[nr++] = 0;
-				run--;
-			}
-		}
-		i = j;
-	}
-	for (uint k = 0; k < nr; k++) cf[rsym[k]]++;
-	char[19] cl;
-	ushort[19] cc;
-	huff_lengths(&cf, 19, 7, &cl);
-	canonical(&cl, 19, &cc);
-	uint hclen = 19;
-	while (hclen > 4 && cl[cl_order[hclen - 1]] == 0) hclen--;
-	b.put(1, 1);  // BFINAL
-	b.put(2, 2);  // BTYPE=10
-	b.put(NLIT - 257, 5);
-	b.put(NDIST - 1, 5);
-	b.put(hclen - 4, 4);
-	for (uint k = 0; k < hclen; k++) b.put(cl[cl_order[k]], 3);
-	for (uint k = 0; k < nr; k++)
-	{
-		char s = rsym[k];
-		b.put(cc[s], cl[s]);
-		if (s == 16)
-		{
-			b.put(rext[k], 2);
-		}
-		else if (s == 17)
-		{
-			b.put(rext[k], 3);
-		}
-		else if (s == 18)
-		{
-			b.put(rext[k], 7);
-		}
-	}
+	self.put(lit_code[s], lit_bits[s]);
 }
 
+fn void Bits.match(&self, uint len, uint dist) @inline
+{
+	uint ls = len_sym[len];
+	self.sym(257 + ls);
+	if (len_extra[ls] != 0) self.put(len - len_base[ls], len_extra[ls]);
+	uint ds = dist <= 256 ? dist_sym_lo[dist] : dist_sym_hi[(dist - 1) >> 7];
+	self.put(dist_code[ds], 5);
+	if (dist_extra[ds] != 0) self.put(dist - dist_base[ds], dist_extra[ds]);
+}
+
+// Four bytes hashed: a 4-byte minimum match loses a few 3-byte matches and skips many false candidates.
 fn uint gz_hash(char* p) @inline
 {
-	return ((((uint)p[0] << 16) | ((uint)p[1] << 8) | (uint)p[2]) * 2654435761u) >> (32 - GZ_HBITS);
+	uint v;
+	memcpy(&v, p, 4);
+	return (v * 2654435761u) >> (32 - GZ_HBITS);
 }
 
-// Length of the common prefix of a and b, at most max (>= 3 is known), eight bytes at a time.
+// Length of the common prefix of a and b, at most max (>= 4 is known), eight bytes at a time.
 fn usz match_len(char* a, char* b, usz max) @inline
 {
-	usz len = 3;
+	usz len = 4;
 	while (len + 8 <= max)
 	{
 		ulong x;
@@ -348,30 +195,21 @@ fn usz match_len(char* a, char* b, usz max) @inline
 	return len;
 }
 
-fn uint dist_symbol(uint dist) @inline
-{
-	return dist <= 256 ? dist_sym_lo[dist] : dist_sym_hi[(dist - 1) >> 7];
-}
-
 // Compresses in[0..n) into out (cap bytes). Returns the gzip size, or 0 if it doesn't fit or n is too
 // large.
 fn usz gzip(char* in, usz n, char* out, usz cap)
 {
-	// the worst case (all literals, 9 bits each) is under n * 9/8 + a header
-	if (n > GZ_MAX_IN || cap < n + n / 8 + 400) return 0;
-	if (gz_head == null)
-	{
-		gz_head = calloc(1u << GZ_HBITS, 2);
-		gz_tok = calloc(GZ_MAX_IN + 1, 4);
-	}
+	// the worst case (all literals, 9 bits each) is under n * 9/8 + 32
+	if (n > GZ_MAX_IN || cap < n + n / 8 + 32) return 0;
+	if (gz_head == null) gz_head = calloc(1u << GZ_HBITS, 2);
 	memset(gz_head, 0, (1u << GZ_HBITS) * 2);
-
-	// pass 1: LZ77 into tokens, counting symbols
-	uint[NLIT] lf = {};
-	uint[NDIST] df = {};
-	uint nt = 0;
+	char[10] gzhdr = { 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3 };
+	memcpy(out, &gzhdr, 10);
+	Bits b = { out, 10, 0, 0 };
+	b.put(1, 1);  // BFINAL
+	b.put(1, 2);  // BTYPE=01 (fixed Huffman)
 	usz i = 0;
-	usz last = n >= 3 ? n - 3 : 0;  // last position with three bytes to hash
+	usz last = n >= 4 ? n - 4 : 0;  // last position with four bytes to hash
 	while (i <= last)
 	{
 		uint h = gz_hash(in + i);
@@ -380,62 +218,27 @@ fn usz gzip(char* in, usz n, char* out, usz cap)
 		if (cand != 0)
 		{
 			cand--;
-			if (i - cand <= 32768 && in[cand] == in[i] && in[cand + 1] == in[i + 1] && in[cand + 2] == in[i + 2])
+			uint x;
+			uint y;
+			memcpy(&x, in + cand, 4);
+			memcpy(&y, in + i, 4);
+			if (x == y && i - cand <= 32768)
 			{
 				usz len = match_len(in + cand, in + i, n - i < 258 ? n - i : 258);
-				uint dist = (uint)(i - cand);
-				gz_tok[nt++] = MATCH | (uint)len << 16 | dist;
-				lf[257 + len_sym[len]]++;
-				df[dist_symbol(dist)]++;
+				b.match((uint)len, (uint)(i - cand));
 				i += len;
 				continue;
 			}
 		}
-		gz_tok[nt++] = in[i];
-		lf[in[i]]++;
+		b.sym(in[i]);
 		i++;
 	}
 	while (i < n)
 	{
-		gz_tok[nt++] = in[i];
-		lf[in[i]]++;
+		b.sym(in[i]);
 		i++;
 	}
-	lf[256]++;
-
-	// trees for this body
-	char[NLIT] ll;
-	char[NDIST] dl;
-	ushort[NLIT] lc;
-	ushort[NDIST] dc;
-	huff_lengths(&lf, NLIT, 15, &ll);
-	canonical(&ll, NLIT, &lc);
-	if (huff_lengths(&df, NDIST, 15, &dl) == 0) dl[0] = 1;  // no matches at all: one dummy distance code keeps the header valid
-	canonical(&dl, NDIST, &dc);
-
-	// pass 2: the bits
-	char[10] gzhdr = { 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3 };
-	memcpy(out, &gzhdr, 10);
-	Bits b = { out, 10, 0, 0 };
-	put_header(&b, &ll, &dl);
-	for (uint k = 0; k < nt; k++)
-	{
-		uint tk = gz_tok[k];
-		if ((tk & MATCH) == 0)
-		{
-			b.put(lc[tk], ll[tk]);
-			continue;
-		}
-		uint len = (tk >> 16) & 0x1ff;
-		uint dist = tk & 0xffff;
-		uint ls = len_sym[len];
-		b.put(lc[257 + ls], ll[257 + ls]);
-		if (len_extra[ls] != 0) b.put(len - len_base[ls], len_extra[ls]);
-		uint ds = dist_symbol(dist);
-		b.put(dc[ds], dl[ds]);
-		if (dist_extra[ds] != 0) b.put(dist - dist_base[ds], dist_extra[ds]);
-	}
-	b.put(lc[256], ll[256]);
+	b.sym(256);
 	b.flush();
 	uint crc = crc32(in, n);
 	uint isz = (uint)n;
